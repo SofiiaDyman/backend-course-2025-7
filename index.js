@@ -1,3 +1,5 @@
+require("dotenv").config();
+
 const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
@@ -5,6 +7,8 @@ const path = require("path");
 const { Command } = require("commander");
 const swaggerJsdoc = require("swagger-jsdoc");
 const swaggerUi = require("swagger-ui-express");
+
+console.log('Hot reload test');
 
 const program = new Command();
 
@@ -28,17 +32,20 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Директорії для даних
-const DATA_FILE = path.join(CACHE_DIR, "inventory.json");
+
+// Директорія для фото
 const PHOTO_DIR = path.join(CACHE_DIR, "photos");
-
 if (!fs.existsSync(PHOTO_DIR)) fs.mkdirSync(PHOTO_DIR);
-if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, "[]");
 
-// Завантаження/збереження даних
-const loadData = () => JSON.parse(fs.readFileSync(DATA_FILE));
-const saveData = (data) =>
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+// Підключення до PostgreSQL
+const { Pool } = require("pg");
+const pool = new Pool({
+  host: process.env.DB_HOST,
+  port: process.env.DB_PORT,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+});
 
 // Multer для фото
 const upload = multer({ dest: PHOTO_DIR });
@@ -100,23 +107,18 @@ app.get("/SearchForm.html", (req, res) => {
  *       400:
  *         description: Не задано ім’я пристрою
  */
-app.post("/register", upload.single("photo"), (req, res) => {
+app.post("/register", upload.single("photo"), async (req, res) => {
   const { inventory_name, description } = req.body;
-
   if (!inventory_name) return res.status(400).json({ error: "Name is required" });
-
-  const items = loadData();
-  const newItem = {
-    id: Date.now().toString(),
-    name: inventory_name,
-    description: description || "",
-    photo: req.file ? req.file.filename : null,
-  };
-
-  items.push(newItem);
-  saveData(items);
-
-  res.status(201).json(newItem);
+  try {
+    const result = await pool.query(
+      "INSERT INTO inventory (item_name, details, photo) VALUES ($1, $2, $3) RETURNING *",
+      [inventory_name, description || "", req.file ? req.file.filename : null]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /inventory
@@ -130,7 +132,14 @@ app.post("/register", upload.single("photo"), (req, res) => {
  *         description: Повертає JSON список всіх пристроїв
  */
 
-app.get("/inventory", (req, res) => res.json(loadData()));
+app.get("/inventory", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM inventory ORDER BY id");
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /**
  * @swagger
@@ -188,35 +197,40 @@ app.get("/inventory", (req, res) => res.json(loadData()));
  *         description: Річ не знайдена
  */
 // GET /inventory/:id
-app.get("/inventory/:id", (req, res) => {
-  const items = loadData();
-  const item = items.find((i) => i.id === req.params.id);
-  if (!item) return res.status(404).json({ error: "Not found" });
-  res.json(item);
+app.get("/inventory/:id", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM inventory WHERE id = $1", [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: "Not found" });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // PUT /inventory/:id
-app.put("/inventory/:id", (req, res) => {
-  const items = loadData();
-  const item = items.find((i) => i.id === req.params.id);
-  if (!item) return res.status(404).json({ error: "Not found" });
-
-  if (req.body.name) item.name = req.body.name;
-  if (req.body.description) item.description = req.body.description;
-
-  saveData(items);
-  res.json(item);
+app.put("/inventory/:id", async (req, res) => {
+  const { name, description } = req.body;
+  try {
+    const result = await pool.query(
+      "UPDATE inventory SET item_name = COALESCE($1, item_name), details = COALESCE($2, details) WHERE id = $3 RETURNING *",
+      [name, description, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Not found" });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // DELETE /inventory/:id
-app.delete("/inventory/:id", (req, res) => {
-  const items = loadData();
-  const index = items.findIndex((i) => i.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: "Not found" });
-
-  items.splice(index, 1);
-  saveData(items);
-  res.json({ status: "deleted" });
+app.delete("/inventory/:id", async (req, res) => {
+  try {
+    const result = await pool.query("DELETE FROM inventory WHERE id = $1 RETURNING *", [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: "Not found" });
+    res.json({ status: "deleted" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 /**
@@ -261,24 +275,30 @@ app.delete("/inventory/:id", (req, res) => {
  */
 
 // GET /inventory/:id/photo
-app.get("/inventory/:id/photo", (req, res) => {
-  const items = loadData();
-  const item = items.find((i) => i.id === req.params.id);
-  if (!item || !item.photo) return res.status(404).json({ error: "Photo not found" });
-
-  res.setHeader("Content-Type", "image/jpeg");
-  res.sendFile(path.join(PHOTO_DIR, item.photo));
+app.get("/inventory/:id/photo", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT photo FROM inventory WHERE id = $1", [req.params.id]);
+    if (result.rows.length === 0 || !result.rows[0].photo) return res.status(404).json({ error: "Photo not found" });
+    res.setHeader("Content-Type", "image/jpeg");
+    res.sendFile(path.join(PHOTO_DIR, result.rows[0].photo));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // PUT /inventory/:id/photo
-app.put("/inventory/:id/photo", upload.single("photo"), (req, res) => {
-  const items = loadData();
-  const item = items.find((i) => i.id === req.params.id);
-  if (!item) return res.status(404).json({ error: "Not found" });
-
-  if (req.file) item.photo = req.file.filename;
-  saveData(items);
-  res.json(item);
+app.put("/inventory/:id/photo", upload.single("photo"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No photo uploaded" });
+  try {
+    const result = await pool.query(
+      "UPDATE inventory SET photo = $1 WHERE id = $2 RETURNING *",
+      [req.file.filename, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Not found" });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // POST /search
@@ -306,19 +326,20 @@ app.put("/inventory/:id/photo", upload.single("photo"), (req, res) => {
  *       404:
  *         description: Річ не знайдена
  */
-app.post("/search", (req, res) => {
+app.post("/search", async (req, res) => {
   const { id, has_photo } = req.body;
-  const items = loadData();
-  const item = items.find((i) => i.id === id);
-
-  if (!item) return res.status(404).send("<h1>Not found</h1>");
-
-  let html = `<h1>${item.name}</h1><p>${item.description}</p>`;
-  if (has_photo === "on" && item.photo) {
-    html += `<img src="/inventory/${id}/photo" width="200">`;
+  try {
+    const result = await pool.query("SELECT * FROM inventory WHERE id = $1", [id]);
+    if (result.rows.length === 0) return res.status(404).send("<h1>Not found</h1>");
+    const item = result.rows[0];
+    let html = `<h1>${item.item_name}</h1><p>${item.details}</p>`;
+    if (has_photo === "on" && item.photo) {
+      html += `<img src="/inventory/${id}/photo" width="200">`;
+    }
+    res.send(html);
+  } catch (err) {
+    res.status(500).send(`<h1>${err.message}</h1>`);
   }
-
-  res.send(html);
 });
 
 // 405 Method Not Allowed
@@ -351,4 +372,3 @@ app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.listen(PORT, HOST, () => {
   console.log(`Server running at http://${HOST}:${PORT}`);
 });
-
